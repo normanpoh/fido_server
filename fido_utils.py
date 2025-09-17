@@ -1,9 +1,11 @@
 import base64
 import re
 import secrets
+import uuid
 from dataclasses import dataclass
 from typing import Optional, List
 
+import cbor2
 from fastapi import HTTPException
 from pydantic import BaseModel
 from webauthn import (
@@ -101,10 +103,16 @@ class CredentialData(BaseModel):
     response: CredentialResponse
 
 
+class AuthenticatorInfo(BaseModel):
+    aaguid: str
+    description: str
+
+
 class UserInfo(BaseModel):
     username: str
     display_name: str
     credentials_count: int
+    authenticators: Optional[List[AuthenticatorInfo]] = []  # Added to account for
 
 
 class StatusResponse(BaseModel):
@@ -115,6 +123,65 @@ class StatusResponse(BaseModel):
 class OperationResult(BaseModel):
     verified: bool
     message: str
+
+
+def extract_aaguid_from_attestation(attestation_object_b64: str) -> Optional[str]:
+    """
+    Extract AAGUID from the attestation object
+
+    Args:
+        attestation_object_b64: Base64 encoded attestation object
+
+    Returns:
+        AAGUID as string if found, None otherwise
+    """
+    try:
+        # Decode the attestation object
+        attestation_object_bytes = base64.b64decode(attestation_object_b64)
+        attestation_object = cbor2.loads(attestation_object_bytes)
+
+        # Get the authenticator data
+        auth_data = attestation_object.get("authData")
+        if not auth_data:
+            logger.warning("No authData found in attestation object")
+            return None
+
+        # Parse authenticator data structure
+        # Bytes 0-32: rpIdHash (32 bytes)
+        # Byte 33: flags (1 byte)
+        # Bytes 34-37: signCount (4 bytes, big-endian)
+        # If AT flag is set (bit 6 of flags), attested credential data follows:
+        #   Bytes 38-53: AAGUID (16 bytes)
+
+        if len(auth_data) < 38:
+            logger.warning("AuthData too short to contain AAGUID")
+            return None
+
+        # Check if AT (Attested credential data) flag is set (bit 6)
+        flags = auth_data[32]
+        at_flag = (flags & 0x40) != 0
+
+        if not at_flag:
+            logger.warning("AT flag not set, no attested credential data")
+            return None
+
+        if len(auth_data) < 54:  # Need at least 54 bytes for AAGUID
+            logger.warning("AuthData too short for AAGUID")
+            return None
+
+        # Extract AAGUID (bytes 37-53, 16 bytes)
+        aaguid_bytes = auth_data[37:53]
+
+        # Convert to UUID string format
+        aaguid_uuid = uuid.UUID(bytes=aaguid_bytes)
+        aaguid_str = str(aaguid_uuid)
+
+        logger.info(f"Extracted AAGUID: {aaguid_str}")
+        return aaguid_str
+
+    except Exception as e:
+        logger.error(f"Error extracting AAGUID: {e}")
+        return None
 
 
 class FIDOServer:
@@ -148,6 +215,18 @@ class FIDOServer:
                 id=base64.b64decode(fix_base64_padding(cred["credential_id"])),
                 type=PublicKeyCredentialType.PUBLIC_KEY,
             )
+            for cred in credentials
+        ]
+
+    def get_authenticator_info(self, username: str) -> list:
+        """Get information about all authenticators registered for a user"""
+        credentials = self.memory_storage.user_credentials.get(username, [])
+        return [
+            {
+                "aaguid": cred.get("aaguid", "Unknown"),
+                "description": cred.get("authenticator_description", "Unknown"),
+                "created_at": cred.get("created_at", "Unknown"),
+            }
             for cred in credentials
         ]
 
@@ -251,6 +330,7 @@ class FIDOServer:
             f"Completing registration with credential_data: {credential_data} and session: {session}"
         )
         try:
+
             # Ensure credential_data.response is a CredentialResponse object
             if isinstance(credential_data.response, dict):
                 credential_data.response = CredentialResponse(
