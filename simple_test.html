@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>FIDO WebAuthn Demo</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        .container { margin: 20px 0; }
+        button { padding: 10px 20px; margin: 10px 0; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background: #0056b3; }
+        button:disabled { background: #6c757d; cursor: not-allowed; }
+        input { padding: 8px; margin: 5px 0; width: 200px; border: 1px solid #ccc; border-radius: 4px; }
+        .result { margin: 10px 0; padding: 10px; border-radius: 4px; }
+        .success { background: #d4edda; border: 1px solid #c3e6cb; color: #155724; }
+        .error { background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; }
+        .info { background: #d1ecf1; border: 1px solid #bee5eb; color: #0c5460; }
+        .section { border: 1px solid #ddd; padding: 20px; margin: 20px 0; border-radius: 8px; }
+        .loading { opacity: 0.7; }
+        .api-docs { margin: 20px 0; }
+        .api-docs a { color: #007bff; text-decoration: none; }
+        .api-docs a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <h1>FIDO WebAuthn Demo Server</h1>
+
+    <div class="api-docs">
+        <strong>API Documentation:</strong>
+        <a href="/docs" target="_blank">Interactive Docs (Swagger)</a> |
+        <a href="/redoc" target="_blank">ReDoc</a>|
+        <a href="/demo" target="_blank">FIDO test page</a>
+        <a href="/logs" target="_blank" style="float: right;">View Logs</a>
+    </div>
+
+    <div class="section">
+        <h2>Registration</h2>
+        <div>
+            <input type="text" id="regUsername" placeholder="Username" />
+            <input type="text" id="regDisplayName" placeholder="Display Name" />
+            <button id="regButton" onclick="startRegistration()">Register New Authenticator</button>
+        </div>
+        <div id="regResult"></div>
+    </div>
+
+    <div class="section">
+        <h2>Authentication</h2>
+        <div>
+            <input type="text" id="authUsername" placeholder="Username" />
+            <button id="authButton" onclick="startAuthentication()">Authenticate</button>
+        </div>
+        <div id="authResult"></div>
+    </div>
+
+    <div class="section">
+        <h2>Status</h2>
+        <div id="status">Not authenticated</div>
+        <button onclick="logout()">Logout</button>
+        <button onclick="checkStatus()">Check Status</button>
+        <button onclick="listUsers()">List Users</button>
+    </div>
+
+    <div class="section">
+        <h2>Registered Users</h2>
+        <div id="userList"></div>
+    </div>
+
+    <script>
+        // Helper function to convert ArrayBuffer to base64
+        function arrayBufferToBase64(buffer) {
+            const bytes = new Uint8Array(buffer);
+            let binary = '';
+            for (let i = 0; i < bytes.byteLength; i++) {
+                binary += String.fromCharCode(bytes[i]);
+            }
+            return btoa(binary);
+        }
+
+        // Helper function to convert base64 to ArrayBuffer
+        function base64ToArrayBuffer(base64) {
+            const binaryString = atob(base64);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            return bytes.buffer;
+        }
+
+        function setLoading(elementId, isLoading) {
+            const button = document.getElementById(elementId);
+            button.disabled = isLoading;
+            button.classList.toggle('loading', isLoading);
+        }
+
+        async function startRegistration() {
+            const username = document.getElementById('regUsername').value;
+            const displayName = document.getElementById('regDisplayName').value;
+
+            if (!username || !displayName) {
+                document.getElementById('regResult').innerHTML = '<div class="error">Please enter username and display name</div>';
+                return;
+            }
+
+            setLoading('regButton', true);
+
+            try {
+                // Start registration
+                const response = await fetch('/api/register/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, displayName })
+                });
+
+                const options = await response.json();
+                if (!response.ok) {
+                    throw new Error(options.detail || 'Registration failed');
+                }
+
+                // Convert base64 to ArrayBuffer for WebAuthn API
+                options.challenge = base64ToArrayBuffer(options.challenge);
+                options.user.id = base64ToArrayBuffer(options.user.id);
+
+                if (options.excludeCredentials) {
+                    options.excludeCredentials = options.excludeCredentials.map(cred => ({
+                        ...cred,
+                        id: base64ToArrayBuffer(cred.id)
+                    }));
+                }
+
+                // Call WebAuthn API
+                const credential = await navigator.credentials.create({ publicKey: options });
+
+                // Convert ArrayBuffer to base64 for transmission
+                const credentialData = {
+                    id: credential.id,
+                    rawId: arrayBufferToBase64(credential.rawId),
+                    type: credential.type,
+                    response: {
+                        clientDataJSON: arrayBufferToBase64(credential.response.clientDataJSON),
+                        attestationObject: arrayBufferToBase64(credential.response.attestationObject)
+                    }
+                };
+
+                // Complete registration
+                const completeResponse = await fetch('/api/register/complete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(credentialData)
+                });
+
+                const result = await completeResponse.json();
+                const resultClass = result.verified ? 'success' : 'error';
+                document.getElementById('regResult').innerHTML = `<div class="${resultClass}">${result.message}</div>`;
+
+                if (result.verified) {
+                    listUsers();
+                }
+
+            } catch (error) {
+                document.getElementById('regResult').innerHTML = `<div class="error">Registration failed: ${error.message}</div>`;
+            } finally {
+                setLoading('regButton', false);
+            }
+        }
+
+        async function startAuthentication() {
+            const username = document.getElementById('authUsername').value;
+
+            if (!username) {
+                document.getElementById('authResult').innerHTML = '<div class="error">Please enter username</div>';
+                return;
+            }
+
+            setLoading('authButton', true);
+
+            try {
+                // Start authentication
+                const response = await fetch('/api/authenticate/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username })
+                });
+
+                const options = await response.json();
+                if (!response.ok) {
+                    throw new Error(options.detail || 'Authentication failed');
+                }
+
+                // Convert base64 to ArrayBuffer
+                options.challenge = base64ToArrayBuffer(options.challenge);
+                options.allowCredentials = options.allowCredentials.map(cred => ({
+                    ...cred,
+                    id: base64ToArrayBuffer(cred.id)
+                }));
+
+                // Call WebAuthn API
+                const credential = await navigator.credentials.get({ publicKey: options });
+
+                // Convert ArrayBuffer to base64
+                const credentialData = {
+                    id: credential.id,
+                    rawId: arrayBufferToBase64(credential.rawId),
+                    type: credential.type,
+                    response: {
+                        clientDataJSON: arrayBufferToBase64(credential.response.clientDataJSON),
+                        authenticatorData: arrayBufferToBase64(credential.response.authenticatorData),
+                        signature: arrayBufferToBase64(credential.response.signature),
+                        userHandle: credential.response.userHandle ? arrayBufferToBase64(credential.response.userHandle) : null
+                    }
+                };
+
+                // Complete authentication
+                const completeResponse = await fetch('/api/authenticate/complete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(credentialData)
+                });
+
+                const result = await completeResponse.json();
+                const resultClass = result.verified ? 'success' : 'error';
+                document.getElementById('authResult').innerHTML = `<div class="${resultClass}">${result.message}</div>`;
+
+                if (result.verified) {
+                    checkStatus();
+                }
+
+            } catch (error) {
+                document.getElementById('authResult').innerHTML = `<div class="error">Authentication failed: ${error.message}</div>`;
+            } finally {
+                setLoading('authButton', false);
+            }
+        }
+
+        async function logout() {
+            const response = await fetch('/api/logout', { method: 'POST' });
+            const result = await response.json();
+            document.getElementById('status').innerHTML = `<div class="info">${result.message}</div>`;
+            checkStatus();
+        }
+
+        async function checkStatus() {
+            const response = await fetch('/api/status');
+            const result = await response.json();
+            const statusClass = result.authenticated ? 'success' : 'info';
+            document.getElementById('status').innerHTML = `<div class="${statusClass}">${result.message}</div>`;
+        }
+
+        async function listUsers() {
+            try {
+                const response = await fetch('/api/users');
+                const result = await response.json();
+
+                if (result.users.length === 0) {
+                    document.getElementById('userList').innerHTML = '<div class="info">No users registered</div>';
+                } else {
+                    const userHtml = result.users.map(user =>
+                        `<div class="info"><strong>${user.username}</strong> (${user.display_name}) - ${user.credentials_count} credential(s)</div>`
+                    ).join('');
+                    document.getElementById('userList').innerHTML = userHtml;
+                }
+            } catch (error) {
+                document.getElementById('userList').innerHTML = '<div class="error">Failed to load users</div>';
+            }
+        }
+
+        // Check status and load users on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            checkStatus();
+            listUsers();
+        });
+    </script>
+</body>
+</html>
