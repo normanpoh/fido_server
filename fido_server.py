@@ -248,16 +248,38 @@ async def logout(session: dict = Depends(get_session)):
 
 @app.get("/api/users")
 async def list_users():
-    """List registered users"""
-    user_list = [
-        UserInfo(
-            username=username,
-            display_name=user_data["display_name"],
-            credentials_count=len(memory.user_credentials.get(username, [])),
+    """List registered users with authenticator details"""
+    user_list = []
+    for username, user_data in memory.users.items():
+        credentials = memory.user_credentials.get(username, [])
+        authenticator_info = []
+
+        for cred in credentials:
+            authenticator_info.append(
+                {
+                    "aaguid": cred.get("aaguid", "Unknown"),
+                    "description": cred.get("authenticator_description", "Unknown"),
+                }
+            )
+
+        user_list.append(
+            UserInfo(
+                username=username,
+                display_name=user_data["display_name"],
+                credentials_count=len(credentials),
+                authenticators=authenticator_info,
+            )
         )
-        for username, user_data in memory.users.items()
-    ]
+
     return {"users": user_list}
+
+
+# Add endpoint to your FastAPI app
+@app.get("/api/users/{username}/authenticators")
+async def get_user_authenticators(username: str):
+    """Get authenticator information for a specific user"""
+    info = fido_server.get_authenticator_info(username)
+    return {"username": username, "authenticators": info}
 
 
 @app.get("/health")
