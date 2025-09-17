@@ -1,11 +1,12 @@
 import base64
+import datetime
 import re
 import secrets
-import uuid
+import json
+
 from dataclasses import dataclass
 from typing import Optional, List
 
-import cbor2
 from fastapi import HTTPException
 from pydantic import BaseModel
 from webauthn import (
@@ -76,6 +77,20 @@ def fix_base64_padding(s: str) -> str:
     return s + "=" * (-len(s) % 4)
 
 
+def time_to_custom_str(now: datetime.datetime | None = None) -> str:
+    """
+    Convert datetime to custom string format YYYYMMDD_HHMMSS
+
+    Example usage with UTC time now:
+    dt = datetime.datetime.now(datetime.timezone.utc)
+    time_to_custom_str(dt)
+    time_to_custom_str()
+    """
+    if now is None:
+        now = datetime.datetime.now(datetime.timezone.utc)
+    return now.strftime("%Y%m%d_%H%M%S")
+
+
 # Pydantic models
 
 
@@ -128,6 +143,7 @@ class OperationResult(BaseModel):
 def extract_aaguid_from_attestation(attestation_object_b64: str) -> Optional[str]:
     """
     Extract AAGUID from the attestation object
+    Returns None if extraction fails (non-breaking)
 
     Args:
         attestation_object_b64: Base64 encoded attestation object
@@ -136,6 +152,10 @@ def extract_aaguid_from_attestation(attestation_object_b64: str) -> Optional[str
         AAGUID as string if found, None otherwise
     """
     try:
+        import base64
+        import cbor2
+        import uuid
+
         # Decode the attestation object
         attestation_object_bytes = base64.b64decode(attestation_object_b64)
         attestation_object = cbor2.loads(attestation_object_bytes)
@@ -143,18 +163,10 @@ def extract_aaguid_from_attestation(attestation_object_b64: str) -> Optional[str
         # Get the authenticator data
         auth_data = attestation_object.get("authData")
         if not auth_data:
-            logger.warning("No authData found in attestation object")
             return None
 
-        # Parse authenticator data structure
-        # Bytes 0-32: rpIdHash (32 bytes)
-        # Byte 33: flags (1 byte)
-        # Bytes 34-37: signCount (4 bytes, big-endian)
-        # If AT flag is set (bit 6 of flags), attested credential data follows:
-        #   Bytes 38-53: AAGUID (16 bytes)
-
+        # Ensure we have enough data for AAGUID
         if len(auth_data) < 38:
-            logger.warning("AuthData too short to contain AAGUID")
             return None
 
         # Check if AT (Attested credential data) flag is set (bit 6)
@@ -162,11 +174,9 @@ def extract_aaguid_from_attestation(attestation_object_b64: str) -> Optional[str
         at_flag = (flags & 0x40) != 0
 
         if not at_flag:
-            logger.warning("AT flag not set, no attested credential data")
             return None
 
         if len(auth_data) < 54:  # Need at least 54 bytes for AAGUID
-            logger.warning("AuthData too short for AAGUID")
             return None
 
         # Extract AAGUID (bytes 37-53, 16 bytes)
@@ -176,11 +186,10 @@ def extract_aaguid_from_attestation(attestation_object_b64: str) -> Optional[str
         aaguid_uuid = uuid.UUID(bytes=aaguid_bytes)
         aaguid_str = str(aaguid_uuid)
 
-        logger.info(f"Extracted AAGUID: {aaguid_str}")
         return aaguid_str
 
     except Exception as e:
-        logger.error(f"Error extracting AAGUID: {e}")
+        logger.debug(f"AAGUID extraction failed: {e}")
         return None
 
 
@@ -218,13 +227,17 @@ class FIDOServer:
             for cred in credentials
         ]
 
+    # Enhanced user info methods that handle missing AAGUID gracefully
     def get_authenticator_info(self, username: str) -> list:
         """Get information about all authenticators registered for a user"""
         credentials = self.memory_storage.user_credentials.get(username, [])
         return [
             {
-                "aaguid": cred.get("aaguid", "Unknown"),
-                "description": cred.get("authenticator_description", "Unknown"),
+                "credential_id": cred.get("credential_id", "Unknown"),
+                "aaguid": cred.get("aaguid", "Not available"),
+                "description": cred.get(
+                    "authenticator_description", "Unknown authenticator"
+                ),
                 "created_at": cred.get("created_at", "Unknown"),
             }
             for cred in credentials
@@ -322,6 +335,53 @@ class FIDOServer:
                 },
             )
 
+    def extract_aaguid_from_attestation_object(self, attestation_object) -> dict:
+        aaguid = None
+        authenticator_description = "Unknown"
+        metadata = None
+
+        try:
+            # Attempt to extract AAGUID (won't break if it fails)
+            aaguid = extract_aaguid_from_attestation(
+                # credential_data.response.attestationObject
+                attestation_object
+            )
+
+            if aaguid:
+                logger.info(f"Registration attempt with AAGUID: {aaguid}")
+
+                # Try to get metadata for this authenticator
+                metadata = self.get_authenticator_metadata(aaguid)
+                if metadata:
+                    authenticator_description = metadata.get("description", "Unknown")
+                    logger.info(
+                        f"Found metadata for authenticator: {authenticator_description}"
+                    )
+
+                    # Optional: Log additional metadata info for interop testing
+                    logger.info(
+                        f"Authenticator details - Version: {metadata.get('authenticatorVersion', 'Unknown')}, "
+                        f"Protocol: {metadata.get('protocolFamily', 'Unknown')}"
+                    )
+                else:
+                    logger.info(
+                        f"No metadata found for AAGUID: {aaguid} (proceeding anyway)"
+                    )
+            else:
+                logger.debug(
+                    "Could not extract AAGUID from attestation object (this is normal for some authenticators)"
+                )
+
+        except Exception as aaguid_error:
+            # AAGUID extraction failed - log but continue with registration
+            logger.debug(f"AAGUID extraction failed (non-critical): {aaguid_error}")
+
+        return {
+            "aaguid": aaguid,
+            "authenticator_description": authenticator_description,
+            "metadata": metadata,
+        }
+
     def complete_registration(
         self, credential_data: CredentialData, session: dict
     ) -> OperationResult:
@@ -330,7 +390,6 @@ class FIDOServer:
             f"Completing registration with credential_data: {credential_data} and session: {session}"
         )
         try:
-
             # Ensure credential_data.response is a CredentialResponse object
             if isinstance(credential_data.response, dict):
                 credential_data.response = CredentialResponse(
@@ -345,12 +404,25 @@ class FIDOServer:
             if not username or not challenge:
                 raise HTTPException(status_code=400, detail="Invalid session state")
 
-            # Create registration credential object
+            # Create a registration credential object
             if not credential_data.response.attestationObject:
                 raise HTTPException(
                     status_code=400,
                     detail="Missing attestationObject in registration response",
                 )
+
+            # Process the attestationObject
+            aaguid_dict = self.extract_aaguid_from_attestation_object(
+                credential_data.response.attestationObject
+            )
+
+            aaguid = aaguid_dict["aaguid"]
+            authenticator_description = aaguid_dict["authenticator_description"]
+            metadata = aaguid_dict["metadata"]
+
+            logger.info(f"AAGUID: {aaguid}")
+            logger.info(f"Authenticator description: {authenticator_description}")
+            logger.info(f"Metadata: {metadata}")
 
             credential = RegistrationCredential(
                 id=credential_data.id,
@@ -373,7 +445,6 @@ class FIDOServer:
             logger.info(f"CredentialData: {credential_data}")
             try:
                 # Extract challenge from clientDataJSON and compare as bytes
-                import json
 
                 client_data = json.loads(
                     base64.b64decode(
@@ -382,56 +453,235 @@ class FIDOServer:
                 )
                 client_challenge_b64url = client_data["challenge"]
                 client_challenge_bytes = base64url_to_bytes(client_challenge_b64url)
-                # expected_challenge_bytes = base64.b64decode(
-                #     fix_base64_padding(challenge)
-                # )
-                # if client_challenge_bytes != expected_challenge_bytes:
-                #     raise Exception("Client data challenge was not expected challenge")
+
                 verification = verify_registration_response(
                     credential=credential,
                     expected_challenge=client_challenge_bytes,  # expected_challenge_bytes,
                     expected_origin=self.origin,
                     expected_rp_id=self.rp_id,
+                    # require_user_verification=False,  # Adjust based on your requirements
                 )
             except Exception as e:
                 logger.error(f"verify_registration_response failed: {e}")
                 raise
             logger.info(f"Verification result: {verification}")
 
-            if verification.user_verified:
-                # Store credential
-                if username not in self.memory_storage.user_credentials:
-                    self.memory_storage.user_credentials[username] = []
+            if not verification.user_verified:
+                return OperationResult(
+                    verified=False, message="Registration verification failed"
+                )
 
-                self.memory_storage.user_credentials[username].append(
+            # Store user if not exists (original logic)
+            if username not in self.memory_storage.user_credentials:
+                self.memory_storage.user_credentials[username] = []
+
+            credential_info = {
+                "credential_id": credential_data.rawId,
+                "public_key": base64.b64encode(
+                    verification.credential_public_key
+                ).decode("utf-8"),
+                "sign_count": verification.sign_count,
+                "credential_device_type": verification.credential_device_type.value,
+                "credential_backed_up": verification.credential_backed_up,
+            }
+            # Add AAGUID info if available (enhancement)
+            if aaguid:
+                credential_info.update(
                     {
-                        "credential_id": credential_data.rawId,
-                        "public_key": base64.b64encode(
-                            verification.credential_public_key
-                        ).decode("utf-8"),
-                        "sign_count": verification.sign_count,
-                        "credential_device_type": verification.credential_device_type.value,
-                        "credential_backed_up": verification.credential_backed_up,
+                        "aaguid": aaguid,
+                        "authenticator_description": authenticator_description,
                     }
                 )
 
-                # Clear session
-                session.pop("challenge", None)
-                session.pop("username", None)
+            self.memory_storage.user_credentials[username].append(credential_info)
 
-                return OperationResult(
-                    verified=True,
-                    message=f"Successfully registered authenticator for {username}",
+            # Clear session
+            session.pop("challenge", None)
+            session.pop("username", None)
+
+            # Set an authenticated session
+            session["authenticated"] = True
+            session["user"] = username
+
+            if aaguid:
+                session["current_aaguid"] = aaguid
+                session["authenticator_description"] = authenticator_description
+
+            logger.info(f"Session after registration: {session}")
+
+            # Create a success message with authenticator info if available
+            if metadata:
+                success_message = (
+                    f"Registration successful for {authenticator_description}"
                 )
             else:
+                success_message = f"Registration successful for user {username}"
+
+            logger.info(f"{success_message}")
+            return OperationResult(verified=True, message=success_message)
+
+        except Exception as webauthn_error:
+            logger.error(f"WebAuthn verification failed: {webauthn_error}")
+            return OperationResult(
+                verified=False, message=f"Registration failed: {str(webauthn_error)}"
+            )
+
+    def complete_registration_with_authenticator(
+        self, credential_data: CredentialData, session: dict
+    ) -> OperationResult:
+        """
+        Complete registration process with optional AAGUID validation
+        Preserves original functionality when AAGUID is not present
+        """
+        try:
+            # Get registration session data
+            challenge = session.get("challenge")
+            username = session.get("registration_username")
+            display_name = session.get("registration_display_name")
+
+            if not challenge or not username:
+                return OperationResult(
+                    verified=False, message="No active registration session found"
+                )
+
+            # Optional AAGUID extraction and metadata lookup (non-breaking enhancement)
+            aaguid = None
+            authenticator_description = "Unknown"
+            metadata = None
+
+            try:
+                # Attempt to extract AAGUID (won't break if it fails)
+                aaguid = extract_aaguid_from_attestation(
+                    credential_data.response.attestationObject
+                )
+
+                if aaguid:
+                    logger.info(f"Registration attempt with AAGUID: {aaguid}")
+
+                    # Try to get metadata for this authenticator
+                    metadata = self.get_authenticator_metadata(aaguid)
+                    if metadata:
+                        authenticator_description = metadata.get(
+                            "description", "Unknown"
+                        )
+                        logger.info(
+                            f"Found metadata for authenticator: {authenticator_description}"
+                        )
+
+                        # Optional: Log additional metadata info for interop testing
+                        logger.info(
+                            f"Authenticator details - Version: {metadata.get('authenticatorVersion', 'Unknown')}, "
+                            f"Protocol: {metadata.get('protocolFamily', 'Unknown')}"
+                        )
+                    else:
+                        logger.info(
+                            f"No metadata found for AAGUID: {aaguid} (proceeding anyway)"
+                        )
+                else:
+                    logger.debug(
+                        "Could not extract AAGUID from attestation object (this is normal for some authenticators)"
+                    )
+
+            except Exception as aaguid_error:
+                # AAGUID extraction failed - log but continue with registration
+                logger.debug(f"AAGUID extraction failed (non-critical): {aaguid_error}")
+
+            # Core WebAuthn verification logic (original functionality preserved)
+            try:
+                # Convert credential data for webauthn library
+                verification_json = {
+                    "id": credential_data.id,
+                    "rawId": credential_data.rawId,
+                    "type": credential_data.type,
+                    "response": {
+                        "clientDataJSON": credential_data.response.clientDataJSON,
+                        "attestationObject": credential_data.response.attestationObject,
+                    },
+                }
+
+                # Perform WebAuthn verification using the py_webauthn library
+                verification = verify_registration_response(
+                    credential=verification_json,
+                    expected_challenge=challenge,
+                    expected_origin=self.origin,
+                    expected_rp_id=self.rp_id,
+                    require_user_verification=False,  # Adjust based on your requirements
+                )
+
+                if not verification.user_verified:
+                    return OperationResult(
+                        verified=False, message="Registration verification failed"
+                    )
+
+                time_now = (
+                    datetime.datetime.now(datetime.timezone.utc)
+                    .replace(microsecond=0)
+                    .isoformat()
+                )
+
+                # Store user if not exists (original logic)
+                if username not in self.memory_storage.users:
+                    self.memory_storage.users[username] = {
+                        "display_name": display_name,
+                        "created_at": time_now,
+                    }
+
+                # Prepare credential info with optional AAGUID data
+                credential_info = {
+                    "credential_id": credential_data.id,
+                    "public_key": verification.credential_public_key,
+                    "sign_count": verification.sign_count,
+                    "created_at": time_now,
+                }
+
+                # Add AAGUID info if available (enhancement)
+                if aaguid:
+                    credential_info.update(
+                        {
+                            "aaguid": aaguid,
+                            "authenticator_description": authenticator_description,
+                        }
+                    )
+
+                    # Store in session for immediate reference
+                    session["current_aaguid"] = aaguid
+                    session["authenticator_description"] = authenticator_description
+
+                # Store credential (original logic with enhancement)
+                if username not in self.memory_storage.user_credentials:
+                    self.memory_storage.user_credentials[username] = []
+
+                self.memory_storage.user_credentials[username].append(credential_info)
+
+                # Update session (original logic)
+                session["authenticated"] = True
+                session["user"] = username
+                # Clear registration session data
+                session.pop("challenge", None)
+                session.pop("registration_username", None)
+                session.pop("registration_display_name", None)
+
+                # Create a success message with authenticator info if available
+                if metadata:
+                    success_message = (
+                        f"Registration successful for {authenticator_description}"
+                    )
+                else:
+                    success_message = f"Registration successful for user {username}"
+
+                logger.info(f"Registration completed for user: {username}")
+                return OperationResult(verified=True, message=success_message)
+
+            except Exception as webauthn_error:
+                logger.error(f"WebAuthn verification failed: {webauthn_error}")
                 return OperationResult(
                     verified=False, message="Registration verification failed"
                 )
 
         except Exception as e:
-            logger.error(f"Registration completion error: {e}")
+            logger.error(f"Registration error: {e}")
             return OperationResult(
-                verified=False, message=f"Registration failed: {str(e)}"
+                verified=False, message="Registration failed due to server error"
             )
 
     def start_authentication(self, username: str, session: dict) -> dict:

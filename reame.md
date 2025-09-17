@@ -16,23 +16,17 @@ pip install pyopenssl
 # Or use ngrok: ngrok http 5000
 ```
 
-3. Configuration
-
-Update these variables for your deployment:
-
+3. Run ngrok
 ```
-RP_ID: Your domain (e.g., "example.com")
-RP_NAME: Your service name
-ORIGIN: Your full URL (must be HTTPS in production)
+ngrok http 8080
+```
+Update [constants.py](constants.py)
+```
 ```
 
 4. Run the server
 ```bash
-python fido_server.py
-```
-or
-```bash
-uvicorn fido_server:app --host 0.0.0.0 --port 8000 --reload
+uvicorn fido_server:app --host 0.0.0.0 --port 8080 --reload
 ```
 
 ## API end points

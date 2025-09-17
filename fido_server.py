@@ -28,6 +28,7 @@ from fido_utils import (
     OperationResult,
     FIDOServer,
     MemoryStorage,
+    time_to_custom_str,
 )
 
 import os
@@ -208,15 +209,37 @@ async def register_complete(
     credential_data: CredentialData, session: dict = Depends(get_session)
 ):
     """Complete registration process"""
-    return fido_server.complete_registration(credential_data, session)
+    res = fido_server.complete_registration(credential_data, session)
+    now_str = time_to_custom_str()
+    save_data(
+        H5_FILE,
+        f"{now_str}-register_complete",
+        credential_data=(
+            credential_data.dict()
+            if hasattr(credential_data, "dict")
+            else str(credential_data)
+        ),
+        session=dict(session),
+        result=res.dict() if hasattr(res, "dict") else str(res),
+    )
+    return res
 
 
 @app.post("/api/authenticate/start")
 async def authenticate_start(
     request: AuthenticationStartRequest, session: dict = Depends(get_session)
 ):
-    """Start authentication process"""
-    return fido_server.start_authentication(request.username, session)
+    """Start an authentication process"""
+    result = fido_server.start_authentication(request.username, session)
+    now_str = time_to_custom_str()
+    save_data(
+        H5_FILE,
+        f"{now_str}-authenticate_start",
+        request=request.dict() if hasattr(request, "dict") else str(request),
+        session=dict(session),
+        response=result,
+    )
+    return result
 
 
 @app.post("/api/authenticate/complete", response_model=OperationResult)
@@ -224,7 +247,20 @@ async def authenticate_complete(
     credential_data: CredentialData, session: dict = Depends(get_session)
 ):
     """Complete authentication process"""
-    return fido_server.complete_authentication(credential_data, session)
+    results = fido_server.complete_authentication(credential_data, session)
+    now_str = time_to_custom_str()
+    save_data(
+        H5_FILE,
+        f"{now_str}-authenticate_complete",
+        credential_data=(
+            credential_data.dict()
+            if hasattr(credential_data, "dict")
+            else str(credential_data)
+        ),
+        session=dict(session),
+        result=results.dict() if hasattr(results, "dict") else str(results),
+    )
+    return results
 
 
 @app.get("/api/status", response_model=StatusResponse)
@@ -294,8 +330,13 @@ async def attestation_options(
     request: dict = Body(...), session: dict = Depends(get_session)
 ):
     logger.info(f"Received attestation_options with request: {request}")
-
-    save_data(H5_FILE, "attestation_options", request=request, session=dict(session))
+    now_str = time_to_custom_str()
+    save_data(
+        H5_FILE,
+        f"{now_str}-attestation_options",
+        request=request,
+        session=dict(session),
+    )
     # Map to registration start
     display_name = (
         request.get("displayName") or request.get("display_name") or "Test User"
@@ -305,7 +346,7 @@ async def attestation_options(
     res = fido_server.start_registration(username, display_name, session)
     logger.info(f"Attestation options response: {res}")
     # Save response to HDF5
-    save_data(H5_FILE, "attestation_options_response", response=res)
+    save_data(H5_FILE, f"{now_str}-attestation_options_response", response=res)
     return res
 
 
@@ -314,10 +355,10 @@ async def attestation_result(
     credential_data: dict = Body(...), session: dict = Depends(get_session)
 ):
     logger.info(f"Received attestation_result with credential_data: {credential_data}")
-
+    now_str = time_to_custom_str()
     save_data(
         H5_FILE,
-        "attestation_result",
+        f"{now_str}-attestation_result",
         credential_data=credential_data,
         session=dict(session),
     )
@@ -329,7 +370,7 @@ async def attestation_result(
     # Save result to HDF5
     save_data(
         H5_FILE,
-        "attestation_result_response",
+        f"{now_str}-attestation_result_response",
         result=result.dict() if hasattr(result, "dict") else str(result),
     )
 
@@ -345,16 +386,19 @@ async def assertion_options(
     request: dict = Body(...), session: dict = Depends(get_session)
 ):
     logger.info(f"Received assertion_options with request: {request}")
+    now_str = time_to_custom_str()
     # Save received variables to HDF5
-    save_data(H5_FILE, "assertion_options", request=request, session=dict(session))
+    save_data(
+        H5_FILE, f"{now_str}-assertion_options", request=request, session=dict(session)
+    )
     # Map to authentication start
-    username = request.get("username") or "test@example.com"
+    username = request.get("username", "Unknown")
     res = fido_server.start_authentication(username, session)
     logger.info(f"Assertion options response: {res}")
 
     # Save response to HDF5
-    save_data(H5_FILE, "assertion_options_response", response=res)
-    save_data(H5_FILE, "memory", memory=memory.export())
+    save_data(H5_FILE, f"{now_str}-assertion_options_response", response=res)
+    save_data(H5_FILE, f"{now_str}-memory", memory=memory.export())
     return res
 
 
@@ -363,10 +407,11 @@ async def assertion_result(
     credential_data: dict = Body(...), session: dict = Depends(get_session)
 ):
     logger.info(f"Received assertion_result with credential_data: {credential_data}")
+    now_str = time_to_custom_str()
     # Save received variables to HDF5
     save_data(
         H5_FILE,
-        "assertion_result",
+        f"{now_str}-assertion_result",
         credential_data=credential_data,
         session=dict(session),
     )
@@ -376,10 +421,10 @@ async def assertion_result(
     # Save result to HDF5
     save_data(
         H5_FILE,
-        "assertion_result_response",
+        f"{now_str}-assertion_result_response",
         result=result.dict() if hasattr(result, "dict") else str(result),
     )
-    save_data(H5_FILE, "memory", memory=memory.export())
+    save_data(H5_FILE, f"{now_str}-memory", memory=memory.export())
 
     logger.info(f"Authentication result: {result}")
     # Interop expects {status: 'ok', ...} on success
@@ -434,6 +479,7 @@ URLs:
 - API Docs: {ORIGIN}/docs
 - ReDoc: {ORIGIN}/redoc
 - Health: {ORIGIN}/health
+- Logs: {ORIGIN}/logs
 
 Requirements:
 - pip install fastapi uvicorn webauthn python-multipart

@@ -333,3 +333,15 @@ def list_all(hdf_file_path: str, namespace="locals") -> dict:
     var_dict = h5.load_all_variables(namespace=namespace)
     h5.close()
     return var_dict
+
+
+def list_namespaces_df(hdf_file_path: str) -> pd.DataFrame:
+    """
+    Return a pandas DataFrame with columns 'namespace' and 'variable' listing all variables in each namespace.
+    """
+    rows = []
+    with h5py.File(hdf_file_path, "r") as h5file:
+        for namespace in h5file.keys():
+            for variable in h5file[namespace].keys():
+                rows.append({"namespace": namespace, "variable": variable})
+    return pd.DataFrame(rows)

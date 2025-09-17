@@ -1,4 +1,4 @@
-NGROK_UUID = "b545096986c1"  # replace with your ngrok uuid
+NGROK_UUID = "afaadfaa985b"  # replace with your ngrok uuid
 
 # Server configuration
 RP_ID = f"{NGROK_UUID}.ngrok-free.app"  # can be "localhost"
